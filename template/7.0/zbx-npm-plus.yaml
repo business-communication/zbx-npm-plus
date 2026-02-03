@@ -1,0 +1,286 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 7df96b18c230490a9a0a9e2307226338
+      name: Templates
+  templates:
+    - uuid: 88454a5ebaa1465bbac4cc2a64736308
+      template: 'Nginx Proxy Manager Plus'
+      name: 'Nginx Proxy Manager Plus'
+      description: 'Tested with npmplus 2026-01-22-r1-bc1866a-2.13.6'
+      groups:
+        - name: Templates
+      items:
+        - uuid: b699799be9ba4e16a0ca9b9751128718
+          name: 'NPM JSON'
+          type: HTTP_AGENT
+          key: npm.json
+          delay: 4h
+          history: 1d
+          value_type: TEXT
+          trends: '0'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  // Zabbix 7.x preprocessing: use HttpRequest, not CurlHttpRequest.
+                  // Goal: authenticate to NPM, read token/session from Set-Cookie and fetch certificates JSON.
+                  
+                  var npmUrl = "{$NPM.URL}".replace(/\/+$/, "");
+                  var email  = "{$NPM.EMAIL}";
+                  var secret = "{$NPM.PASS}";
+                  
+                  /** Extract all name=value cookies from a headers object (case-insensitive Set-Cookie). */
+                  function extractCookieHeader(headersObj) {
+                    var cookies = [];
+                    for (var k in headersObj) {
+                      if (k && k.toLowerCase() === "set-cookie") {
+                        var vals = headersObj[k];
+                        if (!Array.isArray(vals)) vals = [vals];
+                        for (var i = 0; i < vals.length; i++) {
+                          var line = vals[i];
+                          // First name=value pair in the Set-Cookie line
+                          var m = line.match(/^\s*([^=;\s]+)\s*=\s*([^;]+)/);
+                          if (m) cookies.push(m[1] + "=" + m[2]);
+                        }
+                      }
+                    }
+                    return cookies.length ? cookies.join("; ") : null;
+                  }
+                  
+                  /** Login: POST /api/tokens (body JSON), then read cookies from headers only. */
+                  function loginGetCookieHeader(npmUrl, email, secret) {
+                    var req = new HttpRequest();
+                    req.addHeader("Content-Type: application/json; charset=UTF-8");  // IMPORTANT: single string
+                    req.addHeader("Accept: application/json");
+                  
+                    var body = JSON.stringify({ identity: email, secret: secret });
+                  
+                    var resp = req.post(npmUrl + "/api/tokens", body); // Ignore body; we only want cookies
+                    var headers = req.getHeaders(true); // arrays for multi-value header fields
+                    var cookieHeader = extractCookieHeader(headers);
+                  
+                    if (!cookieHeader) {
+                      throw "Login failed: no Set-Cookie returned :: " + JSON.stringify(headers);
+                    }
+                    return cookieHeader;
+                  }
+                  
+                  /** Fetch certificates using Cookie-based auth. */
+                  function fetchCertificates(npmUrl, cookieHeader) {
+                    var req = new HttpRequest();
+                    req.addHeader("Content-Type: application/json; charset=UTF-8");  // IMPORTANT: single string
+                    req.addHeader("Accept: application/json");
+                    req.addHeader("Cookie: " + cookieHeader);
+                  
+                    var url = npmUrl + "/api/nginx/certificates";
+                    var resp = req.get(url);
+                  
+                    var status = 0;
+                    try { status = req.getStatus(); } catch (e) {}
+                    if (status && (status < 200 || status >= 300)) {
+                      throw "GET " + url + " failed with HTTP " + status + " :: " + resp;
+                    }
+                  
+                    var arr;
+                    try { arr = JSON.parse(resp); } catch (e) {
+                      throw "Cannot parse certificates JSON: " + e + " :: " + resp;
+                    }
+                    if (!Array.isArray(arr)) {
+                      throw "Unexpected payload (not array): " + JSON.stringify(arr);
+                    }
+                  
+                    // ---- DROP "meta" FROM EACH ITEM (IN-PLACE) ----
+                    // it may contain private keys
+                    for (var i = 0; i < arr.length; i++) {
+                      var item = arr[i];
+                      if (item && typeof item === "object" && item.hasOwnProperty("meta")) {
+                        delete item.meta;
+                      }
+                    }
+                  
+                    return arr;
+                  }
+                  
+                  // Main
+                  var cookieHeader = loginGetCookieHeader(npmUrl, email, secret);
+                  var certs = fetchCertificates(npmUrl, cookieHeader);
+                  var output = {};
+                  output.certs = certs;
+                  
+                  // Return raw array; discovery will transform to LLD.
+                  return JSON.stringify(output);
+          url: '{$NPM.URL}'
+          output_format: JSON
+          triggers:
+            - uuid: 7cc0514f1597479eb16f682ef04ffe98
+              expression: 'nodata(/Nginx Proxy Manager Plus/npm.json,12h)=1'
+              name: 'No data received from NPM API'
+              priority: HIGH
+              tags:
+                - tag: component
+                  value: certificates
+                - tag: service
+                  value: npm
+        - uuid: de789f5332fc4a1ea430594838ce756a
+          name: 'NPM JSON valid cert list'
+          type: DEPENDENT
+          key: npm.json.certs.ok
+          delay: '0'
+          history: 7d
+          trends: '0'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  // Returns 1 if master item is valid JSON and looks like an array of certs, else 0.
+                  // Never throw here: keep the item supported and let triggers handle failure.
+                  try {
+                    if (value === null) return 0;
+                  
+                    var s = ("" + value).trim();
+                    if (s.length < 2) return 0;
+                  
+                    var j = JSON.parse(s);
+                    if (j.certs === null) return 0;
+                    j = j.certs;
+                  
+                    // NPM /api/certificates typically returns a JSON array.
+                    if (Array.isArray(j)) return 1;
+                  
+                    // If you ever wrap it, accept {"data":[...]} as well.
+                    if (j && Array.isArray(j.data)) return 1;
+                  
+                    return 0;
+                  } catch (e) {
+                    return 0;
+                  }
+          master_item:
+            key: npm.json
+          triggers:
+            - uuid: 42be53e4be8242e7a8174e1d454d34fe
+              expression: 'last(/Nginx Proxy Manager Plus/npm.json.certs.ok)=0'
+              name: 'Wrong JSON received from NPM API'
+              priority: HIGH
+              dependencies:
+                - name: 'No data received from NPM API'
+                  expression: 'nodata(/Nginx Proxy Manager Plus/npm.json,12h)=1'
+              tags:
+                - tag: component
+                  value: certificates
+                - tag: service
+                  value: npm
+      discovery_rules:
+        - uuid: ba7cf7aab5494bb19e59801f1954dc06
+          name: 'NPM certificates discovery'
+          type: DEPENDENT
+          key: npm.certs.discovery
+          delay: '0'
+          item_prototypes:
+            - uuid: 066adc306cd142db9e8a49c5025b85da
+              name: 'Cert "{#CERT_NAME}" - days until expiry'
+              type: DEPENDENT
+              key: 'npm.cert.days_to_exp[{#CERT_ID}]'
+              delay: '0'
+              history: 7d
+              value_type: FLOAT
+              units: d
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      var json = JSON.parse(value);
+                      var arr = json.certs;
+                      var id = "{#CERT_ID}";
+                      var exp = null;
+                      
+                      for (var i=0;i<arr.length;i++){
+                        if (String(arr[i].id) === String(id)) { exp = arr[i].expires_on; break; }
+                      }
+                      if (!exp) return null;
+                      
+                      var m = exp.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+                      if (!m) throw "Bad date: " + exp;
+                      
+                      var ts = new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]).getTime();
+                      return Math.floor((ts - Date.now())/86400000);
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: npm.json
+              tags:
+                - tag: component
+                  value: certificates
+                - tag: scope
+                  value: certificate
+                - tag: service
+                  value: npm
+              trigger_prototypes:
+                - uuid: a3bd95fceb104767aea43f853c723ddf
+                  expression: 'last(/Nginx Proxy Manager Plus/npm.cert.days_to_exp[{#CERT_ID}])<{$NPM.CERT.EXPIRE.CRIT:"{#CERT_ID}"}'
+                  name: 'Cert "{#CERT_NAME}" is expiring'
+                  opdata: 'Cert "{#CERT_NAME}" - days left: {ITEM.LASTVALUE1} (crit<{$NPM.CERT.EXPIRE.CRIT:"{#CERT_ID}"})'
+                  priority: AVERAGE
+                  tags:
+                    - tag: check
+                      value: expiry
+                    - tag: component
+                      value: certificates
+                    - tag: scope
+                      value: certificate
+                    - tag: service
+                      value: npm
+            - uuid: feffe2f52f484f83b9e2a17b0001a3ab
+              name: 'Cert "{#CERT_NAME}" - expires on'
+              type: DEPENDENT
+              key: 'npm.cert.expires_on[{#CERT_ID}]'
+              delay: '0'
+              value_type: TEXT
+              trends: '0'
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.certs[?(@.id=={#CERT_ID})].expires_on.first()'
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              master_item:
+                key: npm.json
+              tags:
+                - tag: component
+                  value: certificates
+                - tag: scope
+                  value: certificate
+                - tag: service
+                  value: npm
+          master_item:
+            key: npm.json
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var json = JSON.parse(value);  // value = master item JSON
+                  var arr = json.certs;
+                  var out = [];
+                  for (var i=0; i<arr.length; i++) {
+                    out.push({
+                      "{#CERT_ID}": String(arr[i].id),
+                      "{#CERT_NAME}": arr[i].nice_name || ""
+                    });
+                  }
+                  return JSON.stringify(out);
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+      tags:
+        - tag: class
+          value: network
+        - tag: target
+          value: npm
+      macros:
+        - macro: '{$NPM.CERT.EXPIRE.CRIT}'
+          value: '2'
+        - macro: '{$NPM.EMAIL}'
+        - macro: '{$NPM.PASS}'
+        - macro: '{$NPM.URL}'
